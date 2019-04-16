@@ -1,37 +1,32 @@
 #!/bin/env python
 #-*- coding:utf-8 -*-
-from sys import stdout
+import struct
 
-from twisted.python import log, failure
-from twisted.conch import error
 from twisted.internet import defer
-from twisted.python.log import startLogging, err
-
-from twisted.internet import reactor
-
-from twisted.conch.ssh.common import NS
-from twisted.conch.scripts.cftp import ClientOptions
-from twisted.conch.ssh.filetransfer import FileTransferClient, FXF_WRITE, FXF_CREAT, FXF_READ
-from twisted.conch.client.connect import connect
-from twisted.conch.client.default import isInKnownHosts
-
-from twisted.conch.ssh.connection import SSHConnection
-from twisted.conch.ssh.channel import SSHChannel
-
-from twisted.conch.ssh import keys, userauth
+from twisted.python import log, failure
 from twisted.python.filepath import FilePath
+
+from twisted.conch import error
+from twisted.conch.ssh.common import NS
+from twisted.conch.ssh import keys, userauth
+from twisted.conch.ssh.channel import SSHChannel
+from twisted.conch.client.connect import connect
+from twisted.conch.scripts.cftp import ClientOptions
+from twisted.conch.ssh.connection import SSHConnection
+from twisted.conch.client.default import isInKnownHosts
+from twisted.conch.ssh.filetransfer import FileTransferClient, FXF_WRITE, FXF_CREAT, FXF_READ
 
 def verifyHostKey(transport, host, pubKey, fingerprint):
     
     isr = isInKnownHosts(host, pubKey, transport.factory.options)
     if isr == 0:
-        return defer.fail(error.ConchError('Not existent key'))
+        return defer.fail(error.ConchError("Not existent key"))
     elif isr == 1:
         return defer.succeed(isr)
     elif isr == 2:
-        return defer.fail(error.ConchError('Changed key'))
+        return defer.fail(error.ConchError("Changed key"))
     else:
-        return defer.fail(error.ConchError('Unknown return %s' % isr))
+        return defer.fail(error.ConchError("Unknown return %s" % isr))
 
 class SSHUserAuthClient(userauth.SSHUserAuthClient):
     def __init__(self, user, options, *args):
@@ -42,7 +37,7 @@ class SSHUserAuthClient(userauth.SSHUserAuthClient):
     def getPublicKey(self):
         if self._tried_key:
             return
-        pubkey = FilePath(self.options['pubkey'])
+        pubkey = FilePath(self.options["pubkey"])
         if not pubkey.isfile():
             return None
         try:
@@ -53,7 +48,7 @@ class SSHUserAuthClient(userauth.SSHUserAuthClient):
             return None
         
     def getPrivateKey(self):
-        privkey = FilePath(self.options['privkey'])
+        privkey = FilePath(self.options["privkey"])
         if not privkey.isfile():
             return None
         try:
@@ -63,11 +58,11 @@ class SSHUserAuthClient(userauth.SSHUserAuthClient):
             return defer.fail(ConchError("Encrypted private-key: %s" % privkey.path))
 
 class SFTPSession(SSHChannel):
-    name = 'session'
+    name = "session"
 
     def channelOpen(self, whatever):
         d = self.conn.sendRequest(
-            self, 'subsystem', NS('sftp'), wantReply=True)
+            self, "subsystem", NS("sftp"), wantReply=True)
         d.addCallbacks(self._cbSFTP)
 
     def _cbSFTP(self, result):
@@ -79,6 +74,15 @@ class SFTPSession(SSHChannel):
 class SFTPConnection(SSHConnection):
     def serviceStarted(self):
         self.openChannel(SFTPSession())
+
+    def adjustWindow(self, channel, bytesToAdd):
+        """
+        重写 adjustWindow 屏蔽原方法日志打印
+        """
+        if channel.localClosed:
+            return # we're already closed
+        self.transport.sendPacket(93, struct.pack(">2L", self.channelsToRemoteChannel[channel], bytesToAdd))
+        channel.localWindowLeft += bytesToAdd        
 
 class SftpClient(object):
     port = 22
@@ -101,10 +105,10 @@ class SftpClient(object):
         
     def doConnect(self):
         options = ClientOptions()
-        options['host'] = self.host
-        options['port'] = self.port
-        options['pubkey'] = self.pubkey
-        options['privkey'] = self.privkey
+        options["host"] = self.host
+        options["port"] = self.port
+        options["pubkey"] = self.pubkey
+        options["privkey"] = self.privkey
         conn = SFTPConnection()
         conn._sftp = defer.Deferred()
         auth = SSHUserAuthClient(self.user, options, conn)
@@ -144,7 +148,7 @@ class SftpClient(object):
     def _cbPutDone(self, ignored, lf, rf):
         lf.close()
         rf.close()
-        return 'Transferred %s to %s' % (lf.name, rf.name)
+        return "Transferred %s to %s" % (lf.name, rf.name)
     
     def _cbGetDone(self, ignored, lf, rf):
         lf.close()
@@ -154,7 +158,7 @@ class SftpClient(object):
     def _getNextChunk(self, chunks):
         end = 0
         for chunk in chunks:
-            if end == 'eof':
+            if end == "eof":
                 return # nothing more to get
             if end != chunk[0]:
                 i = chunks.index(chunk)
@@ -200,7 +204,7 @@ class SftpClient(object):
                 defer.returnValue(e.message)
             i = chunks.index((start, start + size))
             del chunks[i]
-            chunks.insert(i, (start, 'eof'))
+            chunks.insert(i, (start, "eof"))
         elif data:
             lf.seek(start)
             lf.write(data)
@@ -221,7 +225,10 @@ class SftpClient(object):
         _grr = yield self._cbGetRead(_cbr, lf, rf, chunks, start, length)
         defer.returnValue(_grr)
         
-if __name__ == '__main__':
+if __name__ == "__main__":
+    from sys import stdout
+    from twisted.internet import reactor
+    
     log.startLogging(stdout)
     sc = SftpClient("your_host")
     sc.get("local_filename", "host_filename")
