@@ -18,15 +18,17 @@ from twisted.conch.ssh.filetransfer import FileTransferClient, FXF_WRITE, FXF_CR
 
 def verifyHostKey(transport, host, pubKey, fingerprint):
     
-    isr = isInKnownHosts(host, pubKey, transport.factory.options)
-    if isr == 0:
-        return defer.fail(error.ConchError("Not existent key"))
-    elif isr == 1:
-        return defer.succeed(isr)
-    elif isr == 2:
-        return defer.fail(error.ConchError("Changed key"))
+    retVal = isInKnownHosts(host, pubKey, transport.factory.options)
+    if retVal == 1:
+        return defer.succeed(retVal)
+    elif retVal == 0:
+        errmsg = "Not existent key"
+    elif retVal == 2:
+        errmsg = "Changed key"
     else:
-        return defer.fail(error.ConchError("Unknown return %s" % isr))
+        errmsg = "Unknown return %s" % retVal
+    log.err(errmsg)
+    return defer.fail(error.ConchError(errmsg))
 
 class SSHUserAuthClient(userauth.SSHUserAuthClient):
     def __init__(self, user, options, *args):
@@ -39,23 +41,28 @@ class SSHUserAuthClient(userauth.SSHUserAuthClient):
             return
         pubkey = FilePath(self.options["pubkey"])
         if not pubkey.isfile():
+            log.err("PublicKey is not file: %s" % pubkey.path)
             return None
         try:
             key = keys.Key.fromFile(pubkey.path)
             self._tried_key = True
             return key
         except keys.BadKeyError:
+            log.err("PublicKey is bad: %s" % pubkey.path)
             return None
         
     def getPrivateKey(self):
         privkey = FilePath(self.options["privkey"])
         if not privkey.isfile():
+            log.err("Privkey is not file: %s" % privkey.path)
             return None
         try:
-            log.msg(privkey.path)
+            #log.msg(privkey.path)
             return defer.succeed(keys.Key.fromFile(privkey.path))
         except keys.EncryptedKeyError:
-            return defer.fail(ConchError("Encrypted private-key: %s" % privkey.path))
+            errmsg = "Encrypted private-key: %s" % privkey.path
+            log.err(errmsg)
+            return defer.fail(error.ConchError(errmsg))
 
 class SFTPSession(SSHChannel):
     name = "session"
@@ -69,7 +76,7 @@ class SFTPSession(SSHChannel):
         client = FileTransferClient()
         client.makeConnection(self)
         self.dataReceived = client.dataReceived
-        self.conn._sftp.callback(client)
+        self.conn._sftp.callback((self.conn.transport, client))
         
 class SFTPConnection(SSHConnection):
     def serviceStarted(self):
@@ -77,7 +84,7 @@ class SFTPConnection(SSHConnection):
 
     def adjustWindow(self, channel, bytesToAdd):
         """
-        重写 adjustWindow 屏蔽原方法日志打印
+        rewrite 'adjustWindow' method, shielding log display
         """
         if channel.localClosed:
             return # we're already closed
@@ -85,76 +92,12 @@ class SFTPConnection(SSHConnection):
         channel.localWindowLeft += bytesToAdd        
 
 class SftpClient(object):
-    port = 22
-    user = "root"
-    privkey = "ftp_ssh_key"
-    pubkey = "ftp_ssh_key.pub"
     numRequests = 5
     bufferSize = 32768
-    def __init__(self, host):
-        self.host = host
-    
-    @defer.inlineCallbacks    
-    def put(self, local_file, remote_file):
-        lf = FilePath(local_file)
-        if not lf.isfile():
-            defer.returnValue("Cannot find file: %s" % local_file)
+    def __init__(self, conn, client):
+        self.conn = conn
+        self.client = client
         
-        conn = yield self.doConnect()
-        yield self._putRemoteFile(conn, local_file, remote_file)
-        
-    def doConnect(self):
-        options = ClientOptions()
-        options["host"] = self.host
-        options["port"] = self.port
-        options["pubkey"] = self.pubkey
-        options["privkey"] = self.privkey
-        conn = SFTPConnection()
-        conn._sftp = defer.Deferred()
-        auth = SSHUserAuthClient(self.user, options, conn)
-        connect(self.host, self.port, options, verifyHostKey, auth)
-        return conn._sftp
-    
-    @defer.inlineCallbacks
-    def _putRemoteFile(self, conn, local_file, remote_file):
-        lf = file(local_file, "rb")
-        rf  = yield conn.openFile(remote_file, FXF_WRITE | FXF_CREAT, dict())
-        yield self._cbPutOpenFile(lf, rf)
-    
-    @defer.inlineCallbacks
-    def _cbPutOpenFile(self, lf, rf):
-        dList = []
-        chunks = []
-        for i in range(self.numRequests):
-            d = self._cbPutWrite(None, lf, rf, chunks)
-            if d:
-                dList.append(d)
-        lr = yield defer.DeferredList(dList, fireOnOneErrback=1)
-        self._cbPutDone(lr, lf, rf)
-        
-    @defer.inlineCallbacks
-    def _cbPutWrite(self, ignored, lf, rf, chunks):
-        chunk = self._getNextChunk(chunks)
-        start, size = chunk
-        lf.seek(start)
-        data = lf.read(size)
-        if data:
-            ignored = yield rf.writeChunk(start, data)
-            _pwr = yield self._cbPutWrite(ignored, lf, rf, chunks)
-            defer.returnValue(_pwr)
-        else:
-            defer.returnValue("Write completion")
-    
-    def _cbPutDone(self, ignored, lf, rf):
-        lf.close()
-        rf.close()
-        return "Transferred %s to %s" % (lf.name, rf.name)
-    
-    def _cbGetDone(self, ignored, lf, rf):
-        lf.close()
-        rf.close()
-        return "Transferred %s to %s" % (rf.name, lf.name)
-
     def _getNextChunk(self, chunks):
         end = 0
         for chunk in chunks:
@@ -167,21 +110,83 @@ class SftpClient(object):
             end = chunk[1]
         chunks.append((end, end + self.bufferSize))
         return (end, self.bufferSize)
+
+    def close(self):
+        self.conn.transport.loseConnection()
+        self.client.transport.loseConnection()
+        
+    @defer.inlineCallbacks    
+    def put(self, local_file, remote_file):
+        lf = FilePath(local_file)
+        if not lf.isfile():
+            log.err("Cannot find file: %s" % local_file)
+            defer.returnValue(1)
+        rv = yield self._putRemoteFile(self.client, local_file, remote_file)
+        defer.returnValue(rv)
     
+    @defer.inlineCallbacks
+    def _putRemoteFile(self, client, local_file, remote_file):
+        lf = file(local_file, "rb")
+        rf  = yield client.openFile(remote_file, FXF_WRITE | FXF_CREAT, dict())
+        rv = yield self._cbPutOpenFile(lf, rf)
+        defer.returnValue(rv)
+    
+    @defer.inlineCallbacks
+    def _cbPutOpenFile(self, lf, rf):
+        dList = []
+        chunks = []
+        for i in range(self.numRequests):
+            d = self._cbPutWrite(lf, rf, chunks)
+            if d:
+                dList.append(d)
+        lr = yield defer.DeferredList(dList, fireOnOneErrback=1)
+        rv = self._transferDone(lr, lf, rf)
+        defer.returnValue(rv)
+        
+    @defer.inlineCallbacks
+    def _cbPutWrite(self, lf, rf, chunks):
+        chunk = self._getNextChunk(chunks)
+        start, size = chunk
+        lf.seek(start)
+        data = lf.read(size)
+        if data:
+            try:
+                yield rf.writeChunk(start, data)
+                _pwr = yield self._cbPutWrite(lf, rf, chunks)
+                defer.returnValue(_pwr)
+            except Exception, e:
+                log.msg("Write data error: %s" % e.message)
+                defer.returnValue(1)                
+        else:
+            #log.msg("Write completion")
+            defer.returnValue(0)
+    
+    def _transferDone(self, result_list, file_1, file_2):
+        file_1.close()
+        file_2.close()
+        fail_list = filter(lambda _x:_x[1] != 0 or not _x[0], result_list)
+        if not fail_list:    
+            log.msg("Transferred %s to %s done" % (file_1.name, file_2.name))
+            return 0
+        else:
+            log.msg("Transferred %s to %s fail" % (file_1.name, file_2.name))
+            return 1
+
     @defer.inlineCallbacks
     def get(self, local_file, remote_file):
         lf = FilePath(local_file)
         if lf.isfile():
-            defer.returnValue("File already exists: %s" % local_file)
-        
-        conn = yield self.doConnect()
-        yield self._getRemoteFile(conn, local_file, remote_file)
+            log.err("File already exists: %s" % local_file)
+            defer.returnValue(1)
+        rv = yield self._getRemoteFile(self.client, local_file, remote_file)
+        defer.returnValue(rv)
         
     @defer.inlineCallbacks
-    def _getRemoteFile(self, conn, local_file, remote_file):
+    def _getRemoteFile(self, client, local_file, remote_file):
         lf = file(local_file, "wb", 0)
-        rf = yield conn.openFile(remote_file, FXF_READ, dict())
-        yield self._cbGetOpenFile(lf, rf)
+        rf = yield client.openFile(remote_file, FXF_READ, dict())
+        rv = yield self._cbGetOpenFile(lf, rf)
+        defer.returnValue(rv)
     
     @defer.inlineCallbacks    
     def _cbGetOpenFile(self, lf , rf):
@@ -191,17 +196,19 @@ class SftpClient(object):
             d = self._cbGetRead("", lf, rf, chunks, 0, self.bufferSize)
             dList.append(d)
         lr = yield defer.DeferredList(dList, fireOnOneErrback=1)
-        self._cbGetDone(lr, lf, rf)
+        rv = self._transferDone(lr, rf, lf)
+        defer.returnValue(rv)
     
     @defer.inlineCallbacks
     def _cbGetRead(self, data, lf, rf, chunks, start, size):
         if data and isinstance(data, failure.Failure):
-            log.err("Get read err: %s" % data)
+            #log.err("Get read err: %s" % data)
             reason = data
             try:
                 reason.trap(EOFError)
             except Exception, e:
-                defer.returnValue(e.message)
+                log.msg("Get data error: %s" % e.message)
+                defer.returnValue(1)
             i = chunks.index((start, start + size))
             del chunks[i]
             chunks.insert(i, (start, "eof"))
@@ -215,7 +222,8 @@ class SftpClient(object):
                 chunks.insert(i, (start, start + len(data)))
         chunk = self._getNextChunk(chunks)
         if not chunk:
-            defer.returnValue("Read completion")
+            #log.msg("Read completion")
+            defer.returnValue(0)
         else:
             start, length = chunk
         try:
@@ -225,12 +233,35 @@ class SftpClient(object):
         _grr = yield self._cbGetRead(_cbr, lf, rf, chunks, start, length)
         defer.returnValue(_grr)
         
+@defer.inlineCallbacks       
+def doSFTPConnect(host, port=22, user="root", pubkey=None, privkey=None):
+    options = ClientOptions()
+    options["host"] = host
+    options["port"] = port
+    options["pubkey"] = pubkey
+    options["privkey"] = privkey
+    conn = SFTPConnection()
+    conn._sftp = defer.Deferred()
+    auth = SSHUserAuthClient(user, options, conn)
+    yield connect(host, port, options, verifyHostKey, auth)
+    server_conn, server_client = yield conn._sftp
+    sftp_client = SftpClient(server_conn, server_client)
+    defer.returnValue(sftp_client)
+    
+@defer.inlineCallbacks    
+def transferFiles():
+    # my test
+    sftp_client = yield doSFTPConnect("192.168.1.236", port=22, user="root", pubkey="ftp_ssh_key.pub", 
+                 privkey="ftp_ssh_key")
+    pv = yield sftp_client.put("/usr/local/src/Django-1.8.4.tar.gz", "/root/Django-1.8.4.tar.gz")
+    gv = yield sftp_client.get("glibc-2.15.tar.gz", "glibc-2.15.tar.gz")
+    print "pv:%s \n gv:%s" % (pv, gv)
+    yield sftp_client.close()     #  close this sftp client
+    
 if __name__ == "__main__":
     from sys import stdout
     from twisted.internet import reactor
     
     log.startLogging(stdout)
-    sc = SftpClient("your_host")
-    sc.get("local_filename", "host_filename")
-    #sc.put("local_filename", "host_filename")
+    transferFiles()
     reactor.run()
