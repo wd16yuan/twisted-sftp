@@ -94,6 +94,7 @@ class SFTPConnection(SSHConnection):
 class SftpClient(object):
     numRequests = 5
     bufferSize = 32768
+    deferListFail = [(False, 1)]
     def __init__(self, conn, client):
         self.conn = conn
         self.client = client
@@ -136,30 +137,28 @@ class SftpClient(object):
         dList = []
         chunks = []
         for i in range(self.numRequests):
-            d = self._cbPutWrite(lf, rf, chunks)
+            d = self._cbPutWrite(None, lf, rf, chunks)
             if d:
                 dList.append(d)
-        lr = yield defer.DeferredList(dList, fireOnOneErrback=1)
+        try:
+            lr = yield defer.DeferredList(dList, fireOnOneErrback=1, consumeErrors=1)
+        except Exception, e:
+            lr = self.deferListFail
+            log.err(e.__str__())
         rv = self._transferDone(lr, lf, rf)
         defer.returnValue(rv)
         
-    @defer.inlineCallbacks
-    def _cbPutWrite(self, lf, rf, chunks):
+    def _cbPutWrite(self, ignored, lf, rf, chunks):
         chunk = self._getNextChunk(chunks)
         start, size = chunk
         lf.seek(start)
         data = lf.read(size)
         if data:
-            try:
-                yield rf.writeChunk(start, data)
-                _pwr = yield self._cbPutWrite(lf, rf, chunks)
-                defer.returnValue(_pwr)
-            except Exception, e:
-                log.msg("Write data error: %s" % e.message)
-                defer.returnValue(1)                
+            d = rf.writeChunk(start, data)
+            d.addCallback(self._cbPutWrite, lf, rf, chunks)
+            return d
         else:
-            #log.msg("Write completion")
-            defer.returnValue(0)
+            return 0
     
     def _transferDone(self, result_list, file_1, file_2):
         file_1.close()
@@ -195,20 +194,19 @@ class SftpClient(object):
         for i in range(self.numRequests):
             d = self._cbGetRead("", lf, rf, chunks, 0, self.bufferSize)
             dList.append(d)
-        lr = yield defer.DeferredList(dList, fireOnOneErrback=1)
+        try:
+            lr = yield defer.DeferredList(dList, fireOnOneErrback=1, consumeErrors=1)
+        except Exception, e:
+            lr = self.deferListFail
+            log.err(e.__str__())
         rv = self._transferDone(lr, rf, lf)
         defer.returnValue(rv)
     
-    @defer.inlineCallbacks
     def _cbGetRead(self, data, lf, rf, chunks, start, size):
         if data and isinstance(data, failure.Failure):
             #log.err("Get read err: %s" % data)
             reason = data
-            try:
-                reason.trap(EOFError)
-            except Exception, e:
-                log.msg("Get data error: %s" % e.message)
-                defer.returnValue(1)
+            reason.trap(EOFError)
             i = chunks.index((start, start + size))
             del chunks[i]
             chunks.insert(i, (start, "eof"))
@@ -222,16 +220,12 @@ class SftpClient(object):
                 chunks.insert(i, (start, start + len(data)))
         chunk = self._getNextChunk(chunks)
         if not chunk:
-            #log.msg("Read completion")
-            defer.returnValue(0)
+            return 0
         else:
             start, length = chunk
-        try:
-            _cbr = yield rf.readChunk(start, length)
-        except Exception, e:
-            _cbr = failure.Failure(e)
-        _grr = yield self._cbGetRead(_cbr, lf, rf, chunks, start, length)
-        defer.returnValue(_grr)
+        d = rf.readChunk(start, length)
+        d.addBoth(self._cbGetRead, lf, rf, chunks, start, length)
+        return d
         
 @defer.inlineCallbacks       
 def doSFTPConnect(host, port=22, user="root", pubkey=None, privkey=None):
